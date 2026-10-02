@@ -27,7 +27,17 @@ contract RegistryHandler is Test {
 
     function register(uint256 seed, uint256 maskSeed) external {
         address entrant = actor(seed);
-        if (clock >= closesAt || expectedId[entrant] != 0) return;
+        // Exercise invalid transitions instead of silently discarding them.
+        if (clock >= closesAt || expectedId[entrant] != 0) {
+            vm.expectRevert(
+                clock >= closesAt
+                    ? HackathonRegistry.RegistrationClosed.selector
+                    : HackathonRegistry.AlreadyRegistered.selector
+            );
+            vm.prank(entrant);
+            registry.register("Initial", "https://repo.example/initial", "https://demo.example/initial", 1);
+            return;
+        }
         uint256 mask = 1 + maskSeed % 524_287;
         vm.prank(entrant);
         uint256 actualId =
@@ -40,7 +50,17 @@ contract RegistryHandler is Test {
 
     function update(uint256 seed, uint256 maskSeed) external {
         address entrant = actor(seed);
-        if (clock >= closesAt || expectedId[entrant] == 0 || expectedWithdrawn[entrant]) return;
+        if (clock >= closesAt || expectedId[entrant] == 0 || expectedWithdrawn[entrant]) {
+            bytes4 reason = clock >= closesAt
+                ? HackathonRegistry.RegistrationClosed.selector
+                : expectedId[entrant] == 0
+                    ? HackathonRegistry.NotRegistered.selector
+                    : HackathonRegistry.EntryAlreadyWithdrawn.selector;
+            vm.expectRevert(reason);
+            vm.prank(entrant);
+            registry.update("Rejected edit", "https://repo.example/rejected", "https://demo.example/rejected", 1);
+            return;
+        }
         uint256 mask = 1 + maskSeed % 524_287;
         vm.prank(entrant);
         registry.update("Edited", "https://repo.example/edited", "https://demo.example/edited", mask);
@@ -50,10 +70,31 @@ contract RegistryHandler is Test {
 
     function withdraw(uint256 seed) external {
         address entrant = actor(seed);
-        if (expectedId[entrant] == 0 || expectedWithdrawn[entrant]) return;
+        if (expectedId[entrant] == 0 || expectedWithdrawn[entrant]) {
+            vm.expectRevert(
+                expectedId[entrant] == 0
+                    ? HackathonRegistry.NotRegistered.selector
+                    : HackathonRegistry.EntryAlreadyWithdrawn.selector
+            );
+            vm.prank(entrant);
+            registry.withdraw();
+            return;
+        }
         vm.prank(entrant);
         registry.withdraw();
         expectedWithdrawn[entrant] = true;
+    }
+
+    function organiserRegister() external {
+        address organiser = registry.ORGANISER();
+        vm.expectRevert(
+            clock >= closesAt
+                ? HackathonRegistry.RegistrationClosed.selector
+                : HackathonRegistry.OrganiserIneligible.selector
+        );
+        vm.prank(organiser);
+        registry.register("Organiser", "https://repo.example", "https://demo.example", 1);
+        assertEq(registry.entryIdOf(organiser), 0);
     }
 
     function elapse(uint256 seed) external {
@@ -72,15 +113,22 @@ contract RegistryInvariantTest is StdInvariant, Test {
         registry = new HackathonRegistry();
         initialDeadline = registry.deadline();
         handler = new RegistryHandler(registry);
-        bytes4[] memory selectors = new bytes4[](4);
+        // Every sequence starts with live entries, even if time advances immediately.
+        handler.register(0, 0);
+        handler.register(1, 18);
+        bytes4[] memory selectors = new bytes4[](5);
         selectors[0] = RegistryHandler.register.selector;
         selectors[1] = RegistryHandler.update.selector;
         selectors[2] = RegistryHandler.withdraw.selector;
         selectors[3] = RegistryHandler.elapse.selector;
+        selectors[4] = RegistryHandler.organiserRegister.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
 
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 64
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariantOnePermanentIdAndOnlySelfChanges() public view {
         assertEq(registry.entryCount(), handler.registrations());
         assertLe(registry.entryCount(), 6);
@@ -102,6 +150,9 @@ contract RegistryInvariantTest is StdInvariant, Test {
         }
     }
 
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 64
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariantDeadlineAndNoCustody() public view {
         assertEq(registry.deadline(), initialDeadline);
         assertEq(address(registry).balance, 0);
